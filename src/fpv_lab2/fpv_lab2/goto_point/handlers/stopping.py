@@ -1,5 +1,3 @@
-"""Damp the residual horizontal speed, record the result, then land."""
-
 import math
 import time
 from typing import TYPE_CHECKING
@@ -13,48 +11,37 @@ if TYPE_CHECKING:
 
 class StoppingHandler(FlightStateHandler):
 
-    SETTLE_TIMEOUT = 5.0   # seconds
-    SPEED_EPSILON = 0.15   # m/s
+    SETTLE_TIMEOUT = 5.0
+    SPEED_EPSILON = 0.15
 
     def handle(self, node: "GotoPointNode") -> None:
-        node.stop_horizontal_motion()
+        node.halt()
 
-        if node.stop_started_at is None:
-            node.stop_started_at = time.monotonic()
+        if node.brake_at is None:
+            node.brake_at = time.monotonic()
 
-        twist = node.odometry.twist.twist if node.odometry is not None else None
-        speed = math.hypot(twist.linear.x, twist.linear.y) if twist else 0.0
-
-        elapsed = time.monotonic() - node.stop_started_at
-
-        if speed > self.SPEED_EPSILON and elapsed < self.SETTLE_TIMEOUT:
+        elapsed = time.monotonic() - node.brake_at
+        if node.horiz_speed() > self.SPEED_EPSILON and elapsed < self.SETTLE_TIMEOUT:
             return
 
-        position = node.current_position()
-
-        if position is not None and node.target_position is not None:
-            error = math.hypot(
-                position[0] - node.target_position[0],
-                position[1] - node.target_position[1],
-            )
-
-            node.final_position = position
-            node.final_error = error
-
+        pos = node.xyz()
+        if pos is not None and node.goal_xy is not None:
+            err = math.hypot(pos[0] - node.goal_xy[0], pos[1] - node.goal_xy[1])
+            node.result_xyz = pos
+            node.result_err = err
+            home = node.home_xy
             node.get_logger().info("----- RESULT -----")
             node.get_logger().info(
-                f"Start position:  x={node.start_position[0]:.3f} "
-                f"y={node.start_position[1]:.3f}"
+                f"Start position:  x={home[0]:.3f} y={home[1]:.3f}"
             )
             node.get_logger().info(
-                f"Target position: x={node.target_position[0]:.3f} "
-                f"y={node.target_position[1]:.3f}"
+                f"Target position: x={node.goal_xy[0]:.3f} "
+                f"y={node.goal_xy[1]:.3f}"
             )
             node.get_logger().info(
-                f"Actual position: x={position[0]:.3f} "
-                f"y={position[1]:.3f} z={position[2]:.3f}"
+                f"Actual position: x={pos[0]:.3f} y={pos[1]:.3f} z={pos[2]:.3f}"
             )
-            node.get_logger().info(f"Position error:  e={error:.3f} m")
+            node.get_logger().info(f"Position error:  e={err:.3f} m")
             node.get_logger().info("------------------")
 
         node.get_logger().info("Horizontal motion stopped, starting landing")

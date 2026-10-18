@@ -8,7 +8,6 @@ from .goto_point_node import GotoPointNode
 
 def main(args=None):
     rclpy.init(args=args)
-
     node = GotoPointNode()
 
     try:
@@ -19,9 +18,9 @@ def main(args=None):
         ):
             rclpy.spin_once(node, timeout_sec=0.2)
 
-        if node.final_error is not None:
+        if node.result_err is not None:
             node.get_logger().info(
-                f"Flight finished, position error {node.final_error:.3f} m"
+                f"Flight finished, position error {node.result_err:.3f} m"
             )
 
     except KeyboardInterrupt:
@@ -29,7 +28,6 @@ def main(args=None):
 
     finally:
         node.destroy_node()
-
         if rclpy.ok():
             rclpy.shutdown()
 

@@ -1,10 +1,3 @@
-"""Wait until the drone reaches the take-off altitude and settles.
-
-Important: no velocity command may be published here. In GUIDED mode a
-command on /ap/v1/cmd_vel overrides the running TAKEOFF command, and the
-drone never leaves the ground.
-"""
-
 import time
 from typing import TYPE_CHECKING
 
@@ -17,54 +10,49 @@ if TYPE_CHECKING:
 
 class StabilizingHandler(FlightStateHandler):
 
-    ALTITUDE_FRACTION = 0.9   # share of the target altitude counted as reached
-    TAKEOFF_TIMEOUT = 60.0    # seconds
+    ALTITUDE_FRACTION = 0.9
+    TAKEOFF_TIMEOUT = 60.0
 
     def handle(self, node: "GotoPointNode") -> None:
-        if node.disarmed_unexpectedly():
+        if node.was_disarmed():
             node.fail("Drone disarmed unexpectedly during flight")
             return
 
-        position = node.current_position()
-
-        if position is None:
+        if node.xyz() is None:
             return
 
-        altitude = node.altitude_above_start()
-
-        if altitude is None:
+        alt = node.height()
+        if alt is None:
             return
 
         elapsed = time.monotonic() - node.hover_started_at
+        needed = node.TAKEOFF_ALTITUDE * self.ALTITUDE_FRACTION
 
-        required = node.TAKEOFF_ALTITUDE * self.ALTITUDE_FRACTION
-
-        if altitude < required:
+        if alt < needed:
             if elapsed > self.TAKEOFF_TIMEOUT:
                 node.fail(
-                    f"Take-off timed out, altitude {altitude:.2f} m "
+                    f"Take-off timed out, altitude {alt:.2f} m "
                     f"instead of {node.TAKEOFF_ALTITUDE:.2f} m"
                 )
             return
 
-        if node.altitude_reached_at is None:
-            node.altitude_reached_at = time.monotonic()
+        if node.up_at is None:
+            node.up_at = time.monotonic()
             node.get_logger().info(
-                f"Take-off altitude reached: {altitude:.2f} m "
+                f"Take-off altitude reached: {alt:.2f} m "
                 f"above the start point (target {node.TAKEOFF_ALTITUDE:.1f} m)"
             )
             return
 
-        # Hold the position for a short while so the drone settles.
-        if time.monotonic() - node.altitude_reached_at < node.stabilize_duration:
+        if time.monotonic() - node.up_at < node.hold_s:
             return
 
-        if node.target_position is None:
+        if node.goal_xy is None:
             node.fail("No odometry received, target point is unknown")
             return
 
         node.get_logger().info(
-            f"Hover stabilised at {altitude:.2f} m for "
-            f"{node.stabilize_duration:.0f} s, starting flight to the target"
+            f"Hover stabilised at {alt:.2f} m for "
+            f"{node.hold_s:.0f} s, starting flight to the target"
         )
         node.state = GotoState.GOING_TO_TARGET

@@ -1,9 +1,4 @@
 #!/bin/bash
-# Start the whole simulation environment in one command:
-# Gazebo (maze world) + ArduPilot SITL + micro-ROS DDS agent + RViz.
-#
-# ArduPilot SITL writes its working files (eeprom.bin, mav.tlog, logs,
-# terrain) into the current directory, so the run directory is used.
 
 set -e
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"

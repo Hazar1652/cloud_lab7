@@ -1,9 +1,4 @@
 #!/bin/bash
-# Wait until ArduPilot SITL is fully up and the vehicle passes the pre-arm
-# check. After a fresh start the EKF needs time to converge on the GPS
-# solution; until then pre-arm answers "Vehicle is Not Armable" and the
-# flight node stops with an error.
-# Source setup_env.sh before calling this script.
 
 TIMEOUT=${1:-300}
 DEADLINE=$(( $(date +%s) + TIMEOUT ))
@@ -16,9 +11,6 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     sleep 3
 done
 
-# Right after start-up the EKF solution is still settling, so ArduPilot can
-# answer "Armable" once and "Not Armable" a few seconds later. Require three
-# consecutive positive answers before reporting the vehicle as ready.
 REQUIRED=3
 STREAK=0
 

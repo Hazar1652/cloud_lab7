@@ -6,8 +6,7 @@ from .prearm_retry import RetryingPrearmCheckHandler
 from .stabilizing import StabilizingHandler
 from .stopping import StoppingHandler
 
-# The base handlers are reused as-is; only the hovering step is replaced
-# and two new states are added.
+
 GOTO_HANDLERS = {
     **BASE_HANDLERS,
     FlightState.PREARM_CHECK: RetryingPrearmCheckHandler(),

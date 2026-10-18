@@ -1,16 +1,3 @@
-"""ROS 2 node that flies the drone to an individually assigned point.
-
-The node reuses FlightTestNode from the reference project without
-modifying it: take-off, arming and landing logic stay exactly the same.
-Only the hovering phase is replaced by horizontal navigation towards
-the target point.
-
-Target point (Appendix 2 of the lab manual):
-    x_target = x0 - delta_x
-    y_target = y0 - delta_y
-where (x0, y0) is the position actually measured at start-up.
-"""
-
 import math
 
 from geometry_msgs.msg import TwistStamped
@@ -19,151 +6,121 @@ from ..flight_test.flight_test_node import FlightTestNode
 from .handlers import GOTO_HANDLERS
 
 
+_PARAM_SPEC = (
+    ("delta_x", 0.0),
+    ("delta_y", 0.0),
+    ("takeoff_altitude", 2.0),
+    ("tolerance", 0.25),
+    ("max_speed", 1.5),
+    ("min_speed", 0.15),
+    ("slowdown_radius", 2.5),
+    ("stabilize_duration", 5.0),
+    ("axis_direction", 1.0),
+)
+
+
 class GotoPointNode(FlightTestNode):
 
     def __init__(self):
         super().__init__()
-
-        # Use the extended handler map instead of the base one.
         self._handlers = GOTO_HANDLERS
 
-        self.declare_parameter("delta_x", 0.0)
-        self.declare_parameter("delta_y", 0.0)
-        self.declare_parameter("takeoff_altitude", 2.0)
-        self.declare_parameter("tolerance", 0.25)
-        self.declare_parameter("max_speed", 1.5)
-        self.declare_parameter("min_speed", 0.15)
-        self.declare_parameter("slowdown_radius", 2.5)
-        self.declare_parameter("stabilize_duration", 5.0)
-        # Appendix 2 of the manual defines the target as x0 - delta_x.
-        # Measured against the real maze.sdf, that direction runs into
-        # Wall_9 (x = -1 m) for all 56 variants, while the manual states
-        # that no route crosses a wall. The axis of the manual is therefore
-        # opposite to the x axis of /odometry, so the offset is applied with
-        # this sign. Set it to -1.0 to follow the manual literally.
-        self.declare_parameter("axis_direction", 1.0)
+        raw = {}
+        for key, fallback in _PARAM_SPEC:
+            self.declare_parameter(key, fallback)
+            raw[key] = self.get_parameter(key).value
 
-        self.axis_direction = self.get_parameter("axis_direction").value
-        self.delta_x = self.get_parameter("delta_x").value * self.axis_direction
-        self.delta_y = self.get_parameter("delta_y").value * self.axis_direction
-        self.tolerance = self.get_parameter("tolerance").value
-        self.max_speed = self.get_parameter("max_speed").value
-        self.min_speed = self.get_parameter("min_speed").value
-        self.slowdown_radius = self.get_parameter("slowdown_radius").value
-        self.stabilize_duration = self.get_parameter("stabilize_duration").value
+        sign = raw["axis_direction"]
+        self._shift = (raw["delta_x"] * sign, raw["delta_y"] * sign)
+        self.TAKEOFF_ALTITUDE = raw["takeoff_altitude"]
+        self.HOVER_DURATION = raw["stabilize_duration"]
+        self.hold_s = raw["stabilize_duration"]
+        self.tol = raw["tolerance"]
+        self.v_max = raw["max_speed"]
+        self.v_min = raw["min_speed"]
+        self.brake_r = raw["slowdown_radius"]
 
-        # Override the take-off altitude of the base class per instance.
-        self.TAKEOFF_ALTITUDE = self.get_parameter("takeoff_altitude").value
+        self._ever_armed = False
+        self._home = None
+        self._goal = None
+        self.up_at = None
+        self.brake_at = None
+        self.result_xyz = None
+        self.result_err = None
 
-        # HOVER_DURATION of the base class is reused as the stabilisation
-        # time before navigation starts.
-        self.HOVER_DURATION = self.stabilize_duration
-
-        # /ap/v1/status is published at a lower rate than the control loop,
-        # so right after arming it can still report armed=False. Treat a
-        # false reading as a real disarm only after the drone was actually
-        # seen armed at least once.
-        self.seen_armed = False
-
-        self.start_position = None
-        self.start_altitude = None
-        self.target_position = None
-        self.altitude_reached_at = None
-        self.stop_started_at = None
-        self.final_position = None
-        self.final_error = None
-
-        self.cmd_vel_publisher = self.create_publisher(
-            TwistStamped,
-            "/ap/v1/cmd_vel",
-            10,
-        )
+        self._cmd = self.create_publisher(TwistStamped, "/ap/v1/cmd_vel", 10)
 
         self.get_logger().info(
-            f"Target offset applied: dx={self.delta_x:+.2f} m, "
-            f"dy={self.delta_y:+.2f} m (axis_direction={self.axis_direction:+.0f})"
+            f"Target offset applied: dx={self._shift[0]:+.2f} m, "
+            f"dy={self._shift[1]:+.2f} m (axis_direction={sign:+.0f})"
         )
 
     def status_callback(self, message):
         super().status_callback(message)
+        self._ever_armed = self._ever_armed or bool(message.armed)
 
-        if message.armed:
-            self.seen_armed = True
-
-    def disarmed_unexpectedly(self):
-        """True only if the drone was armed before and is not armed now."""
+    def was_disarmed(self):
         if self.status is None:
             return False
-
-        return self.seen_armed and not self.status.armed
+        return self._ever_armed and not self.status.armed
 
     def odometry_callback(self, message):
-        """Remember the very first measured position as the start point."""
         super().odometry_callback(message)
+        if self._home is not None:
+            return
 
-        if self.start_position is None:
-            x0 = message.pose.pose.position.x
-            y0 = message.pose.pose.position.y
+        p = message.pose.pose.position
+        self._home = (p.x, p.y, p.z)
+        self._goal = (p.x + self._shift[0], p.y + self._shift[1])
 
-            # z of a landed drone is not zero: it is the height of the body
-            # frame above the ground. Altitude gained during take-off is
-            # therefore measured relative to this value, not to the world
-            # origin.
-            self.start_altitude = message.pose.pose.position.z
+        self.get_logger().info(f"Start position:  x0={p.x:.3f} m, y0={p.y:.3f} m")
+        self.get_logger().info(
+            f"Target position: x={self._goal[0]:.3f} m, y={self._goal[1]:.3f} m"
+        )
 
-            self.start_position = (x0, y0)
-            # delta_x / delta_y already carry the sign of axis_direction
-            self.target_position = (x0 + self.delta_x, y0 + self.delta_y)
-
-            self.get_logger().info(
-                f"Start position:  x0={x0:.3f} m, y0={y0:.3f} m"
-            )
-            self.get_logger().info(
-                f"Target position: x={self.target_position[0]:.3f} m, "
-                f"y={self.target_position[1]:.3f} m"
-            )
-
-    def altitude_above_start(self):
-        """Height gained since take-off, in metres."""
-        if self.odometry is None or self.start_altitude is None:
+    @property
+    def home_xy(self):
+        if self._home is None:
             return None
+        return (self._home[0], self._home[1])
 
-        return self.odometry.pose.pose.position.z - self.start_altitude
+    @property
+    def goal_xy(self):
+        return self._goal
 
-    def current_position(self):
+    def xyz(self):
         if self.odometry is None:
             return None
+        p = self.odometry.pose.pose.position
+        return (p.x, p.y, p.z)
 
-        position = self.odometry.pose.pose.position
-        return (position.x, position.y, position.z)
-
-    def distance_to_target(self):
-        """Horizontal distance to the target point, or None if unknown."""
-        position = self.current_position()
-
-        if position is None or self.target_position is None:
+    def height(self):
+        now = self.xyz()
+        if now is None or self._home is None:
             return None
+        return now[2] - self._home[2]
 
-        dx = self.target_position[0] - position[0]
-        dy = self.target_position[1] - position[1]
+    def range_xy(self):
+        now = self.xyz()
+        if now is None or self._goal is None:
+            return None
+        return math.hypot(self._goal[0] - now[0], self._goal[1] - now[1])
 
-        return math.hypot(dx, dy)
+    def horiz_speed(self):
+        if self.odometry is None:
+            return 0.0
+        t = self.odometry.twist.twist
+        return math.hypot(t.linear.x, t.linear.y)
 
-    def send_velocity(self, vx, vy):
-        """Publish a horizontal velocity command in the ENU map frame.
+    def drive(self, east, north):
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
+        msg.twist.linear.x = float(east)
+        msg.twist.linear.y = float(north)
+        msg.twist.linear.z = 0.0
+        msg.twist.angular.z = 0.0
+        self._cmd.publish(msg)
 
-        For frame_id "map" ArduPilot reads twist.linear.x as the East
-        component and twist.linear.y as the North component.
-        """
-        message = TwistStamped()
-        message.header.stamp = self.get_clock().now().to_msg()
-        message.header.frame_id = "map"
-        message.twist.linear.x = float(vx)
-        message.twist.linear.y = float(vy)
-        message.twist.linear.z = 0.0
-        message.twist.angular.z = 0.0
-
-        self.cmd_vel_publisher.publish(message)
-
-    def stop_horizontal_motion(self):
-        self.send_velocity(0.0, 0.0)
+    def halt(self):
+        self.drive(0.0, 0.0)
